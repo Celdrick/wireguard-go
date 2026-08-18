@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PATH="$ROOT:$PATH"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -41,6 +42,33 @@ grep -q 'persistent_keepalive_interval=25' "$OUT/clients/win1/client.conf"
 grep -q 'endpoint=203.0.113.10:51820' "$OUT/clients/linux1/client.conf"
 grep -q 'allowed_ip=10.10.0.1/32' "$OUT/clients/linux1/client.conf"
 
+grep -q 'wireguard-go-gm -f wg0' "$OUT/server/up.sh"
+grep -q 'wg-gm setconf wg0 server.conf' "$OUT/server/up.sh"
+grep -q 'ip addr add 10.10.0.1/24 dev wg0' "$OUT/server/up.sh"
+grep -q 'wireguard-go-gm -f wg0' "$OUT/clients/win1/linux-up.sh"
+grep -q 'wg-gm setconf wg0 client.conf' "$OUT/clients/win1/linux-up.sh"
+grep -q 'New-NetIPAddress' "$OUT/clients/win1/windows-up.ps1"
+grep -q 'wg-gm.exe setconf wg0 client.conf' "$OUT/clients/win1/windows-up.ps1"
+
+PSK_OUT="$TMPDIR/out-psk"
+bash "$ROOT/scripts/gen-configs.sh" \
+  --config "$ROOT/scripts/testdata/generator.env" \
+  --output-dir "$PSK_OUT" \
+  --preshared-key true \
+  --server-endpoint 198.51.100.7
+
+grep -Eq '^[0-9a-f]{64}$' "$PSK_OUT/server/preshared_key"
+grep -q 'preshared_key=' "$PSK_OUT/server/server.conf"
+grep -q 'preshared_key=' "$PSK_OUT/clients/win1/client.conf"
+grep -q 'endpoint=198.51.100.7:51820' "$PSK_OUT/clients/win1/client.conf"
+
+if bash "$ROOT/scripts/gen-configs.sh" \
+  --config "$ROOT/scripts/testdata/generator.env" \
+  --output-dir "$OUT" >/dev/null 2>&1; then
+  echo "expected overwrite protection failure" >&2
+  exit 1
+fi
+
 CUSTOM_OUT="$TMPDIR/custom"
 bash "$ROOT/scripts/gen-configs.sh" \
   --config "$ROOT/scripts/testdata/generator.env" \
@@ -56,7 +84,7 @@ INVALID_NAME_OUT="$TMPDIR/invalid-name"
 if bash "$ROOT/scripts/gen-configs.sh" \
   --config "$ROOT/scripts/testdata/generator.env" \
   --clients '../escape' \
-  --output-dir "$INVALID_NAME_OUT"; then
+  --output-dir "$INVALID_NAME_OUT" >/dev/null 2>&1; then
   exit 1
 fi
 test ! -e "$INVALID_NAME_OUT"
@@ -66,7 +94,7 @@ if bash "$ROOT/scripts/gen-configs.sh" \
   --config "$ROOT/scripts/testdata/generator.env" \
   --server-tun-ip 10.20.30.1/30 \
   --clients one,two \
-  --output-dir "$OVERFLOW_OUT"; then
+  --output-dir "$OVERFLOW_OUT" >/dev/null 2>&1; then
   exit 1
 fi
 test ! -e "$OVERFLOW_OUT"
@@ -106,7 +134,7 @@ if PATH="$BAD_BIN:$PATH" BAD_MODE=client WG_GM_STATE="$BAD_STATE" \
   bash "$ROOT/scripts/gen-configs.sh" \
     --config "$ROOT/scripts/testdata/generator.env" \
     --clients badclient \
-    --output-dir "$BAD_CLIENT_OUT"; then
+    --output-dir "$BAD_CLIENT_OUT" >/dev/null 2>&1; then
   exit 1
 fi
 test ! -f "$BAD_CLIENT_OUT/clients/badclient/privatekey"
@@ -116,7 +144,7 @@ if PATH="$BAD_BIN:$PATH" BAD_MODE=psk \
   bash "$ROOT/scripts/gen-configs.sh" \
     --config "$ROOT/scripts/testdata/generator.env" \
     --preshared-key true \
-    --output-dir "$BAD_PSK_OUT"; then
+    --output-dir "$BAD_PSK_OUT" >/dev/null 2>&1; then
   exit 1
 fi
 test ! -e "$BAD_PSK_OUT"

@@ -100,6 +100,48 @@ require_hex_value() {
 	}
 }
 
+write_server_up() {
+	cat > "${OUTPUT_DIR}/server/up.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+sudo LOG_LEVEL=verbose ./wireguard-go-gm -f ${SERVER_IFACE} &
+echo "Run in a second terminal: sudo ./wg-gm setconf ${SERVER_IFACE} server.conf"
+echo "Then configure the interface address:"
+echo "  sudo ip addr add ${SERVER_TUN_IP} dev ${SERVER_IFACE}"
+echo "  sudo ip link set ${SERVER_IFACE} up"
+wait
+EOF
+	chmod +x "${OUTPUT_DIR}/server/up.sh"
+}
+
+write_client_linux_up() {
+	local path="$1" ip="$2"
+	cat > "${path}/linux-up.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+sudo LOG_LEVEL=verbose ./wireguard-go-gm -f ${SERVER_IFACE} &
+sleep 1
+sudo ./wg-gm setconf ${SERVER_IFACE} client.conf
+sudo ip addr add ${ip}/32 dev ${SERVER_IFACE}
+sudo ip link set ${SERVER_IFACE} up
+sudo ip route add 10.10.0.1/32 dev ${SERVER_IFACE}
+wait
+EOF
+	chmod +x "${path}/linux-up.sh"
+}
+
+write_client_windows_up() {
+	local path="$1" ip="$2"
+	cat > "${path}/windows-up.ps1" <<EOF
+\$ErrorActionPreference = "Stop"
+Start-Process -FilePath ".\\wireguard-go-gm.exe" -ArgumentList "${SERVER_IFACE}"
+Start-Sleep -Seconds 1
+.\\wg-gm.exe setconf ${SERVER_IFACE} client.conf
+New-NetIPAddress -InterfaceAlias "${SERVER_IFACE}" -IPAddress "${ip}" -PrefixLength 32
+New-NetRoute -InterfaceAlias "${SERVER_IFACE}" -DestinationPrefix "10.10.0.1/32"
+EOF
+}
+
 main() {
 	parse_args "$@"
 	load_config
@@ -159,7 +201,7 @@ main() {
 		printf 'listen_port=%s\n' "${SERVER_PORT}"
 		printf '\n'
 	} > "${server_conf}"
-	: > "${OUTPUT_DIR}/server/up.sh"
+	write_server_up
 
 	local idx=0
 	for raw_name in "${client_names[@]}"; do
@@ -199,8 +241,8 @@ main() {
 			[[ -n "${psk}" ]] && printf 'preshared_key=%s\n' "${psk}"
 			printf 'allowed_ip=%s/32\n' "${cip}"
 		} >> "${server_conf}"
-		: > "${cdir}/linux-up.sh"
-		: > "${cdir}/windows-up.ps1"
+		write_client_linux_up "${cdir}" "${cip}"
+		write_client_windows_up "${cdir}" "${cip}"
 
 		idx=$((idx + 1))
 	done
