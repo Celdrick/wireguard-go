@@ -124,7 +124,7 @@ sleep 1
 sudo ./wg-gm setconf ${SERVER_IFACE} client.conf
 sudo ip addr add ${ip}/32 dev ${SERVER_IFACE}
 sudo ip link set ${SERVER_IFACE} up
-sudo ip route add 10.10.0.1/32 dev ${SERVER_IFACE}
+sudo ip route add ${TUNNEL_SERVER_IP}/32 dev ${SERVER_IFACE}
 wait
 EOF
 	chmod +x "${path}/linux-up.sh"
@@ -138,7 +138,7 @@ Start-Process -FilePath ".\\wireguard-go-gm.exe" -ArgumentList "${SERVER_IFACE}"
 Start-Sleep -Seconds 1
 .\\wg-gm.exe setconf ${SERVER_IFACE} client.conf
 New-NetIPAddress -InterfaceAlias "${SERVER_IFACE}" -IPAddress "${ip}" -PrefixLength 32
-New-NetRoute -InterfaceAlias "${SERVER_IFACE}" -DestinationPrefix "10.10.0.1/32"
+New-NetRoute -InterfaceAlias "${SERVER_IFACE}" -DestinationPrefix "${TUNNEL_SERVER_IP}/32"
 EOF
 }
 
@@ -162,7 +162,7 @@ main() {
 	}
 
 	IFS=',' read -r -a client_names <<< "${CLIENTS}"
-	local name raw_name client_count=0 available_clients
+	local name raw_name client_count=0 available_clients seen_names=$'\n'
 	for raw_name in "${client_names[@]}"; do
 		name="$(printf '%s' "${raw_name}" | tr -d '[:space:]')"
 		[[ -n "${name}" ]] || continue
@@ -170,6 +170,11 @@ main() {
 			printf 'invalid client name: %s\n' "${name}" >&2
 			exit 1
 		}
+		[[ "${seen_names}" == *$'\n'"${name}"$'\n'* ]] && {
+			printf 'duplicate client name: %s\n' "${name}" >&2
+			exit 1
+		}
+		seen_names+="${name}"$'\n'
 		client_count=$((client_count + 1))
 	done
 	((client_count > 0)) || { printf 'CLIENTS is required\n' >&2; exit 1; }
@@ -192,15 +197,22 @@ main() {
 
 	mkdir -p "${OUTPUT_DIR}/server/clients" "${OUTPUT_DIR}/clients"
 	printf '%s\n' "${server_private}" > "${OUTPUT_DIR}/server/privatekey"
+	chmod 600 "${OUTPUT_DIR}/server/privatekey"
 	printf '%s\n' "${server_public}" > "${OUTPUT_DIR}/server/publickey"
-	[[ -n "${psk}" ]] && printf '%s\n' "${psk}" > "${OUTPUT_DIR}/server/preshared_key"
+	if [[ -n "${psk}" ]]; then
+		printf '%s\n' "${psk}" > "${OUTPUT_DIR}/server/preshared_key"
+		chmod 600 "${OUTPUT_DIR}/server/preshared_key"
+	fi
 
+	# A blank line terminates a UAPI "set" operation (see device/uapi.go), so the
+	# generated configs must never contain one or wg-gm setconf silently drops
+	# everything after it.
 	local server_conf="${OUTPUT_DIR}/server/server.conf"
 	{
 		printf 'private_key=%s\n' "${server_private}"
 		printf 'listen_port=%s\n' "${SERVER_PORT}"
-		printf '\n'
 	} > "${server_conf}"
+	chmod 600 "${server_conf}"
 	write_server_up
 
 	local idx=0
@@ -217,6 +229,7 @@ main() {
 		require_hex_value "${name} private key" "${cpriv}" '^[0-9a-f]{64}$'
 		require_hex_value "${name} public key" "${cpub}" '^[0-9a-f]{130}$'
 		printf '%s\n' "${cpriv}" > "${cdir}/privatekey"
+		chmod 600 "${cdir}/privatekey"
 		printf '%s\n' "${cpub}" > "${cdir}/publickey"
 
 		cconf="${cdir}/client.conf"
@@ -228,6 +241,7 @@ main() {
 			printf 'allowed_ip=%s/32\n' "${TUNNEL_SERVER_IP}"
 			printf 'persistent_keepalive_interval=25\n'
 		} > "${cconf}"
+		chmod 600 "${cconf}"
 
 		peerconf="${OUTPUT_DIR}/server/clients/${name}.peer.conf"
 		{
@@ -235,9 +249,10 @@ main() {
 			[[ -n "${psk}" ]] && printf 'preshared_key=%s\n' "${psk}"
 			printf 'allowed_ip=%s/32\n' "${cip}"
 		} > "${peerconf}"
+		chmod 600 "${peerconf}"
 
 		{
-			printf '\npublic_key=%s\n' "${cpub}"
+			printf 'public_key=%s\n' "${cpub}"
 			[[ -n "${psk}" ]] && printf 'preshared_key=%s\n' "${psk}"
 			printf 'allowed_ip=%s/32\n' "${cip}"
 		} >> "${server_conf}"
