@@ -1,3 +1,6 @@
 wireguard-go
+wireguard-go-gm
+wg-gm
+out/
 # Added by code-review-graph
 .code-review-graph/

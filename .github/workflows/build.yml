@@ -1,0 +1,92 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25.x"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout wireguard-go
+        uses: actions/checkout@v4
+
+      - name: Checkout gmsm
+        run: git clone --depth 1 https://github.com/emmansun/gmsm.git ../gmsm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Unit tests
+        run: go test ./...
+
+      - name: Generator script tests
+        run: make test-scripts
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - name: Checkout wireguard-go
+        uses: actions/checkout@v4
+
+      - name: Checkout gmsm
+        run: git clone --depth 1 https://github.com/emmansun/gmsm.git ../gmsm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Resolve version
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}-gm"
+          else
+            version="0.1.0-gm"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Using VERSION=${version}"
+
+      - name: Build release tarball
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TARGETS: ${{ matrix.goos }}-${{ matrix.goarch }}
+        run: bash scripts/build-release.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireguard-gm-${{ steps.meta.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/wireguard-gm-*.tar.gz
+          if-no-files-found: error
