@@ -9,6 +9,9 @@ CLIENTS=""
 OUTPUT_DIR=""
 PRESHARED_KEY="false"
 CONFIG_FILE=""
+TUNNEL_SERVER_IP=""
+TUNNEL_SERVER_INT=0
+TUNNEL_BROADCAST_INT=0
 
 usage() {
 	cat <<'EOF'
@@ -41,13 +44,58 @@ parse_args() {
 
 client_ip() {
 	local index="$1"
-	printf '10.10.0.%d' "$((index + 2))"
+	integer_to_ip "$((TUNNEL_SERVER_INT + index + 1))"
 }
 
-require_hex_file() {
-	local path="$1" regex="$2"
-	grep -Eq "$regex" "$path" || {
-		printf 'invalid generated key at %s\n' "$path" >&2
+ip_to_integer() {
+	local ip="$1" octet
+	local -a octets
+
+	[[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+	IFS='.' read -r -a octets <<< "$ip"
+	for octet in "${octets[@]}"; do
+		((10#$octet <= 255)) || return 1
+	done
+	printf '%d' "$(((10#${octets[0]} << 24) + (10#${octets[1]} << 16) + (10#${octets[2]} << 8) + 10#${octets[3]}))"
+}
+
+integer_to_ip() {
+	local ip="$1"
+	printf '%d.%d.%d.%d' \
+		"$(((ip >> 24) & 255))" "$(((ip >> 16) & 255))" \
+		"$(((ip >> 8) & 255))" "$((ip & 255))"
+}
+
+parse_tunnel_cidr() {
+	local ip prefix extra mask network
+
+	IFS='/' read -r ip prefix extra <<< "$SERVER_TUN_IP"
+	[[ -n "$ip" && -n "$prefix" && -z "$extra" && "$prefix" =~ ^[0-9]+$ ]] || {
+		printf 'SERVER_TUN_IP must be an IPv4 CIDR\n' >&2
+		exit 1
+	}
+	((10#$prefix <= 30)) || {
+		printf 'SERVER_TUN_IP prefix must be between 0 and 30\n' >&2
+		exit 1
+	}
+	TUNNEL_SERVER_INT="$(ip_to_integer "$ip")" || {
+		printf 'SERVER_TUN_IP must be an IPv4 CIDR\n' >&2
+		exit 1
+	}
+	mask=$(((0xFFFFFFFF << (32 - 10#$prefix)) & 0xFFFFFFFF))
+	network=$((TUNNEL_SERVER_INT & mask))
+	TUNNEL_BROADCAST_INT=$((network | ((~mask) & 0xFFFFFFFF)))
+	((TUNNEL_SERVER_INT > network && TUNNEL_SERVER_INT < TUNNEL_BROADCAST_INT)) || {
+		printf 'SERVER_TUN_IP must use a usable host address\n' >&2
+		exit 1
+	}
+	TUNNEL_SERVER_IP="$(integer_to_ip "$TUNNEL_SERVER_INT")"
+}
+
+require_hex_value() {
+	local label="$1" value="$2" regex="$3"
+	[[ "$value" =~ $regex ]] || {
+		printf 'invalid generated key: %s\n' "$label" >&2
 		exit 1
 	}
 }
@@ -65,26 +113,45 @@ main() {
 		printf 'PRESHARED_KEY must be true or false\n' >&2
 		exit 1
 	}
+	parse_tunnel_cidr
 	command -v wg-gm >/dev/null || {
 		printf 'wg-gm is required but was not found in PATH\n' >&2
 		exit 1
 	}
 
-	mkdir -p "${OUTPUT_DIR}/server/clients" "${OUTPUT_DIR}/clients"
+	IFS=',' read -r -a client_names <<< "${CLIENTS}"
+	local name raw_name client_count=0 available_clients
+	for raw_name in "${client_names[@]}"; do
+		name="$(printf '%s' "${raw_name}" | tr -d '[:space:]')"
+		[[ -n "${name}" ]] || continue
+		[[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+			printf 'invalid client name: %s\n' "${name}" >&2
+			exit 1
+		}
+		client_count=$((client_count + 1))
+	done
+	((client_count > 0)) || { printf 'CLIENTS is required\n' >&2; exit 1; }
+	available_clients=$((TUNNEL_BROADCAST_INT - TUNNEL_SERVER_INT - 1))
+	((client_count <= available_clients)) || {
+		printf 'CLIENTS exceeds available tunnel addresses\n' >&2
+		exit 1
+	}
 
 	local server_private server_public psk=""
 	server_private="$(wg-gm genkey)"
 	server_public="$(printf '%s\n' "${server_private}" | wg-gm pubkey)"
-	printf '%s\n' "${server_private}" > "${OUTPUT_DIR}/server/privatekey"
-	printf '%s\n' "${server_public}" > "${OUTPUT_DIR}/server/publickey"
+	require_hex_value "server private key" "${server_private}" '^[0-9a-f]{64}$'
+	require_hex_value "server public key" "${server_public}" '^[0-9a-f]{130}$'
 
 	if [[ "${PRESHARED_KEY}" == "true" ]]; then
 		psk="$(wg-gm genpsk)"
-		printf '%s\n' "${psk}" > "${OUTPUT_DIR}/server/preshared_key"
+		require_hex_value "preshared key" "${psk}" '^[0-9a-f]{64}$'
 	fi
 
-	require_hex_file "${OUTPUT_DIR}/server/privatekey" '^[0-9a-f]{64}$'
-	require_hex_file "${OUTPUT_DIR}/server/publickey" '^[0-9a-f]{130}$'
+	mkdir -p "${OUTPUT_DIR}/server/clients" "${OUTPUT_DIR}/clients"
+	printf '%s\n' "${server_private}" > "${OUTPUT_DIR}/server/privatekey"
+	printf '%s\n' "${server_public}" > "${OUTPUT_DIR}/server/publickey"
+	[[ -n "${psk}" ]] && printf '%s\n' "${psk}" > "${OUTPUT_DIR}/server/preshared_key"
 
 	local server_conf="${OUTPUT_DIR}/server/server.conf"
 	{
@@ -94,10 +161,8 @@ main() {
 	} > "${server_conf}"
 	: > "${OUTPUT_DIR}/server/up.sh"
 
-	IFS=',' read -r -a client_names <<< "${CLIENTS}"
 	local idx=0
 	for raw_name in "${client_names[@]}"; do
-		local name
 		name="$(printf '%s' "${raw_name}" | tr -d '[:space:]')"
 		[[ -n "${name}" ]] || continue
 
@@ -107,6 +172,8 @@ main() {
 		mkdir -p "${cdir}"
 		cpriv="$(wg-gm genkey)"
 		cpub="$(printf '%s\n' "${cpriv}" | wg-gm pubkey)"
+		require_hex_value "${name} private key" "${cpriv}" '^[0-9a-f]{64}$'
+		require_hex_value "${name} public key" "${cpub}" '^[0-9a-f]{130}$'
 		printf '%s\n' "${cpriv}" > "${cdir}/privatekey"
 		printf '%s\n' "${cpub}" > "${cdir}/publickey"
 
@@ -116,7 +183,7 @@ main() {
 			printf 'public_key=%s\n' "${server_public}"
 			[[ -n "${psk}" ]] && printf 'preshared_key=%s\n' "${psk}"
 			printf 'endpoint=%s:%s\n' "${SERVER_ENDPOINT}" "${SERVER_PORT}"
-			printf 'allowed_ip=10.10.0.1/32\n'
+			printf 'allowed_ip=%s/32\n' "${TUNNEL_SERVER_IP}"
 			printf 'persistent_keepalive_interval=25\n'
 		} > "${cconf}"
 
