@@ -24,8 +24,12 @@ install: wireguard-go
 
 test:
 	go test ./...
+	$(MAKE) test-scripts
+
+test-scripts:
+	bash scripts/gen-configs_test.sh
 
 clean:
 	rm -f wireguard-go
 
-.PHONY: all clean test install generate-version-and-build
+.PHONY: all clean test test-scripts install generate-version-and-build
