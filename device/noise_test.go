@@ -21,14 +21,16 @@ func TestCurveWrappers(t *testing.T) {
 	sk2, err := newPrivateKey()
 	assertNil(t, err)
 
-	pk1 := sk1.publicKey()
-	pk2 := sk2.publicKey()
+	pk1, err := sk1.publicKey()
+	assertNil(t, err)
+	pk2, err := sk2.publicKey()
+	assertNil(t, err)
 
 	ss1, err1 := sk1.sharedSecret(pk2)
 	ss2, err2 := sk2.sharedSecret(pk1)
 
 	if ss1 != ss2 || err1 != nil || err2 != nil {
-		t.Fatal("Failed to compute shared secet")
+		t.Fatal("Failed to compute shared secret")
 	}
 }
 
@@ -63,11 +65,16 @@ func TestNoiseHandshake(t *testing.T) {
 	defer dev1.Close()
 	defer dev2.Close()
 
-	peer1, err := dev2.NewPeer(dev1.staticIdentity.privateKey.publicKey())
+	pub1, err := dev1.staticIdentity.privateKey.publicKey()
+	assertNil(t, err)
+	pub2, err := dev2.staticIdentity.privateKey.publicKey()
+	assertNil(t, err)
+
+	peer1, err := dev2.NewPeer(pub1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer2, err := dev1.NewPeer(dev2.staticIdentity.privateKey.publicKey())
+	peer2, err := dev1.NewPeer(pub2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,10 +86,6 @@ func TestNoiseHandshake(t *testing.T) {
 		peer1.handshake.precomputedStaticStatic[:],
 		peer2.handshake.precomputedStaticStatic[:],
 	)
-
-	/* simulate handshake */
-
-	// initiation message
 
 	t.Log("exchange initiation message")
 
@@ -110,8 +113,6 @@ func TestNoiseHandshake(t *testing.T) {
 		peer2.handshake.hash[:],
 	)
 
-	// response message
-
 	t.Log("exchange response message")
 
 	msg2, err := dev2.CreateMessageResponse(peer1)
@@ -134,8 +135,6 @@ func TestNoiseHandshake(t *testing.T) {
 		peer2.handshake.hash[:],
 	)
 
-	// key pairs
-
 	t.Log("deriving keys")
 
 	err = peer1.BeginSymmetricSession()
@@ -150,8 +149,6 @@ func TestNoiseHandshake(t *testing.T) {
 
 	key1 := peer1.keypairs.next.Load()
 	key2 := peer2.keypairs.current
-
-	// encrypting / decryption test
 
 	t.Log("test key pairs")
 
@@ -176,4 +173,13 @@ func TestNoiseHandshake(t *testing.T) {
 		assertNil(t, err)
 		assertEqual(t, out, testMsg)
 	}()
+}
+
+func TestMessageSizes(t *testing.T) {
+	if MessageInitiationSize != 214 {
+		t.Fatalf("MessageInitiationSize = %d, want 214", MessageInitiationSize)
+	}
+	if MessageResponseSize != 125 {
+		t.Fatalf("MessageResponseSize = %d, want 125", MessageResponseSize)
+	}
 }

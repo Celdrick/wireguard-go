@@ -46,6 +46,8 @@ type StdNetBind struct {
 
 	blackhole4 bool
 	blackhole6 bool
+
+	receiverCreator ReceiverCreator
 }
 
 func NewStdNetBind() Bind {
@@ -71,6 +73,12 @@ func NewStdNetBind() Bind {
 			},
 		},
 	}
+}
+
+func NewStdNetBindWithReceiverCreator(receiverCreator ReceiverCreator) *StdNetBind {
+	b, _ := NewStdNetBind().(*StdNetBind)
+	b.receiverCreator = receiverCreator
+	return b
 }
 
 type StdNetEndpoint struct {
@@ -179,7 +187,11 @@ again:
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
 		}
-		fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
+		if s.receiverCreator != nil {
+			fns = append(fns, s.receiverCreator.CreateReceiverFn(v4pc, v4conn, s.ipv4RxOffload, &s.msgsPool))
+		} else {
+			fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
+		}
 		s.ipv4 = v4conn
 	}
 	if v6conn != nil {
@@ -188,7 +200,11 @@ again:
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc
 		}
-		fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
+		if s.receiverCreator != nil {
+			fns = append(fns, s.receiverCreator.CreateReceiverFn(v6pc, v6conn, s.ipv6RxOffload, &s.msgsPool))
+		} else {
+			fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
+		}
 		s.ipv6 = v6conn
 	}
 	if len(fns) == 0 {

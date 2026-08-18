@@ -6,6 +6,9 @@
 package device
 
 import (
+	"errors"
+	"fmt"
+	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -89,6 +92,12 @@ type Device struct {
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      *Logger
+
+	// batchSizeOverride, when nonzero, replaces the value returned by
+	// BatchSize and is used to size per-goroutine eager buffer allocations.
+	// Must be set before calling Up so that the first bind/receive goroutines
+	// pick it up.
+	batchSizeOverride atomic.Int32
 }
 
 // deviceState represents the state of a Device.
@@ -247,7 +256,13 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 
 	// remove peers with matching public keys
 
-	publicKey := sk.publicKey()
+	publicKey, err := sk.publicKey()
+	if err != nil {
+		for _, peer := range lockedPeers {
+			peer.handshake.mutex.RUnlock()
+		}
+		return err
+	}
 	for key, peer := range device.peers.keyMap {
 		if peer.handshake.remoteStatic.Equals(publicKey) {
 			peer.handshake.mutex.RUnlock()
@@ -298,6 +313,10 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.rate.limiter.Init()
 	device.indexTable.Init()
 
+	if MaxBatchSizeOverride > 0 {
+		device.batchSizeOverride.Store(int32(MaxBatchSizeOverride))
+	}
+
 	device.PopulatePools()
 
 	// create queues
@@ -328,14 +347,30 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 // BatchSize returns the BatchSize for the device as a whole which is the max of
 // the bind batch size and the tun batch size. The batch size reported by device
 // is the size used to construct memory pools, and is the allowed batch size for
-// the lifetime of the device.
+// the lifetime of the device. A nonzero override set via SetMaxBatchSize
+// takes precedence and is returned as-is.
 func (device *Device) BatchSize() int {
+	if o := device.batchSizeOverride.Load(); o > 0 {
+		return int(o)
+	}
 	size := device.net.bind.BatchSize()
 	dSize := device.tun.device.BatchSize()
 	if size < dSize {
 		size = dSize
 	}
 	return size
+}
+
+// SetMaxBatchSize overrides the per-batch size used by the receive and TUN
+// read goroutines, and therefore the number of message buffers each of them
+// holds eagerly for the lifetime of the Device. Zero disables the override.
+// Must be called before Up; already-running goroutines keep the batch size
+// they started with.
+func (device *Device) SetMaxBatchSize(n int) {
+	if n < 0 {
+		n = 0
+	}
+	device.batchSizeOverride.Store(int32(n))
 }
 
 func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
@@ -519,7 +554,7 @@ func (device *Device) BindUpdate() error {
 	device.net.stopping.Add(len(recvFns))
 	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
 	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
-	batchSize := netc.bind.BatchSize()
+	batchSize := device.BatchSize()
 	for _, fn := range recvFns {
 		go device.RoutineReceiveIncoming(batchSize, fn)
 	}
@@ -533,4 +568,28 @@ func (device *Device) BindClose() error {
 	err := closeBindLocked(device)
 	device.net.Unlock()
 	return err
+}
+
+// CreateOutboundPacket creates and routes a packet to the appropriate peer
+func (device *Device) CreateOutboundPacket(payload []byte, dstIP net.IP) error {
+	peer := device.allowedips.Lookup(dstIP)
+	if peer == nil {
+		return fmt.Errorf("no peer found for IP %v", dstIP)
+	}
+	if !peer.isRunning.Load() {
+		return errors.New("peer not running")
+	}
+
+	elem := device.GetOutboundElement()
+	elem.buffer = device.GetMessageBuffer()
+
+	copy(elem.buffer[MessageTransportOffsetContent:], payload)
+	elem.packet = elem.buffer[MessageTransportOffsetContent : MessageTransportOffsetContent+len(payload)]
+
+	container := device.GetOutboundElementsContainer()
+	container.elems = append(container.elems, elem)
+
+	peer.StagePackets(container)
+	peer.SendStagedPackets()
+	return nil
 }

@@ -6,9 +6,10 @@
 package device
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"sync"
+
+	gmsmrand "github.com/emmansun/gmsm/rand"
 )
 
 type IndexTableEntry struct {
@@ -24,7 +25,7 @@ type IndexTable struct {
 
 func randUint32() (uint32, error) {
 	var integer [4]byte
-	_, err := rand.Read(integer[:])
+	_, err := gmsmrand.Read(integer[:])
 	// Arbitrary endianness; both are intrinsified by the Go compiler.
 	return binary.LittleEndian.Uint32(integer[:]), err
 }

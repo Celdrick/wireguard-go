@@ -12,10 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/blake2s"
-	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/poly1305"
-
+	wgcrypto "golang.zx2c4.com/wireguard/device/crypto"
 	"golang.zx2c4.com/wireguard/tai64n"
 )
 
@@ -47,8 +44,8 @@ func (hs handshakeState) String() string {
 }
 
 const (
-	NoiseConstruction = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
-	WGIdentifier      = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+	NoiseConstruction = "Noise_IKpsk2_SM2_SM4GCM_SM3"
+	WGIdentifier      = "WireGuard-GM v1 gm-wg"
 	WGLabelMAC1       = "mac1----"
 	WGLabelCookie     = "cookie--"
 )
@@ -61,13 +58,13 @@ const (
 )
 
 const (
-	MessageInitiationSize      = 148                                           // size of handshake initiation message
-	MessageResponseSize        = 92                                            // size of response message
-	MessageCookieReplySize     = 64                                            // size of cookie reply message
-	MessageTransportHeaderSize = 16                                            // size of data preceding content in transport message
-	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
-	MessageKeepaliveSize       = MessageTransportSize                          // size of keepalive
-	MessageHandshakeSize       = MessageInitiationSize                         // size of largest handshake related message
+	MessageInitiationSize      = 8 + NoisePublicKeySize + (NoisePublicKeySize + wgcrypto.AeadTagSize) + (tai64n.TimestampSize + wgcrypto.AeadTagSize) + wgcrypto.MacSize + wgcrypto.MacSize
+	MessageResponseSize        = 12 + NoisePublicKeySize + wgcrypto.AeadTagSize + wgcrypto.MacSize + wgcrypto.MacSize
+	MessageCookieReplySize     = 8 + wgcrypto.AeadNonceXSize + wgcrypto.MacSize + wgcrypto.AeadTagSize
+	MessageTransportHeaderSize = 16
+	MessageTransportSize       = MessageTransportHeaderSize + wgcrypto.AeadTagSize
+	MessageKeepaliveSize       = MessageTransportSize
+	MessageHandshakeSize       = MessageInitiationSize
 )
 
 const (
@@ -76,20 +73,14 @@ const (
 	MessageTransportOffsetContent  = 16
 )
 
-/* Type is an 8-bit field, followed by 3 nul bytes,
- * by marshalling the messages in little-endian byteorder
- * we can treat these as a 32-bit unsigned int (for now)
- *
- */
-
 type MessageInitiation struct {
 	Type      uint32
 	Sender    uint32
 	Ephemeral NoisePublicKey
-	Static    [NoisePublicKeySize + poly1305.TagSize]byte
-	Timestamp [tai64n.TimestampSize + poly1305.TagSize]byte
-	MAC1      [blake2s.Size128]byte
-	MAC2      [blake2s.Size128]byte
+	Static    [NoisePublicKeySize + wgcrypto.AeadTagSize]byte
+	Timestamp [tai64n.TimestampSize + wgcrypto.AeadTagSize]byte
+	MAC1      [wgcrypto.MacSize]byte
+	MAC2      [wgcrypto.MacSize]byte
 }
 
 type MessageResponse struct {
@@ -97,9 +88,9 @@ type MessageResponse struct {
 	Sender    uint32
 	Receiver  uint32
 	Ephemeral NoisePublicKey
-	Empty     [poly1305.TagSize]byte
-	MAC1      [blake2s.Size128]byte
-	MAC2      [blake2s.Size128]byte
+	Empty     [wgcrypto.AeadTagSize]byte
+	MAC1      [wgcrypto.MacSize]byte
+	MAC2      [wgcrypto.MacSize]byte
 }
 
 type MessageTransport struct {
@@ -112,8 +103,8 @@ type MessageTransport struct {
 type MessageCookieReply struct {
 	Type     uint32
 	Receiver uint32
-	Nonce    [chacha20poly1305.NonceSizeX]byte
-	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+	Nonce    [wgcrypto.AeadNonceXSize]byte
+	Cookie   [wgcrypto.MacSize + wgcrypto.AeadTagSize]byte
 }
 
 var errMessageLengthMismatch = errors.New("message length mismatch")
@@ -211,36 +202,32 @@ func (msg *MessageCookieReply) marshal(b []byte) error {
 type Handshake struct {
 	state                     handshakeState
 	mutex                     sync.RWMutex
-	hash                      [blake2s.Size]byte       // hash value
-	chainKey                  [blake2s.Size]byte       // chain key
-	presharedKey              NoisePresharedKey        // psk
-	localEphemeral            NoisePrivateKey          // ephemeral secret key
-	localIndex                uint32                   // used to clear hash-table
-	remoteIndex               uint32                   // index for sending
-	remoteStatic              NoisePublicKey           // long term key
-	remoteEphemeral           NoisePublicKey           // ephemeral public key
-	precomputedStaticStatic   [NoisePublicKeySize]byte // precomputed shared secret
+	hash                      [wgcrypto.HashSize]byte
+	chainKey                  [wgcrypto.HashSize]byte
+	presharedKey              NoisePresharedKey
+	localEphemeral            NoisePrivateKey
+	localIndex                uint32
+	remoteIndex               uint32
+	remoteStatic              NoisePublicKey
+	remoteEphemeral           NoisePublicKey
+	precomputedStaticStatic   [wgcrypto.HashSize]byte
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
 }
 
 var (
-	InitialChainKey [blake2s.Size]byte
-	InitialHash     [blake2s.Size]byte
-	ZeroNonce       [chacha20poly1305.NonceSize]byte
+	InitialChainKey [wgcrypto.HashSize]byte
+	InitialHash     [wgcrypto.HashSize]byte
+	ZeroNonce       [wgcrypto.AeadNonceSize]byte
 )
 
-func mixKey(dst, c *[blake2s.Size]byte, data []byte) {
+func mixKey(dst, c *[wgcrypto.HashSize]byte, data []byte) {
 	KDF1(dst, c[:], data)
 }
 
-func mixHash(dst, h *[blake2s.Size]byte, data []byte) {
-	hash, _ := blake2s.New256(nil)
-	hash.Write(h[:])
-	hash.Write(data)
-	hash.Sum(dst[:0])
-	hash.Reset()
+func mixHash(dst, h *[wgcrypto.HashSize]byte, data []byte) {
+	wgcrypto.MixHash(dst, h, data)
 }
 
 func (h *Handshake) Clear() {
@@ -260,10 +247,8 @@ func (h *Handshake) mixKey(data []byte) {
 	mixKey(&h.chainKey, &h.chainKey, data)
 }
 
-/* Do basic precomputations
- */
 func init() {
-	InitialChainKey = blake2s.Sum256([]byte(NoiseConstruction))
+	InitialChainKey = wgcrypto.Sum256([]byte(NoiseConstruction))
 	mixHash(&InitialHash, &InitialChainKey, []byte(WGIdentifier))
 }
 
@@ -275,7 +260,6 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()
 
-	// create ephemeral key
 	var err error
 	handshake.hash = InitialHash
 	handshake.chainKey = InitialChainKey
@@ -286,45 +270,43 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 
 	handshake.mixHash(handshake.remoteStatic[:])
 
+	ephemeral, err := handshake.localEphemeral.publicKey()
+	if err != nil {
+		return nil, err
+	}
+
 	msg := MessageInitiation{
 		Type:      MessageInitiationType,
-		Ephemeral: handshake.localEphemeral.publicKey(),
+		Ephemeral: ephemeral,
 	}
 
 	handshake.mixKey(msg.Ephemeral[:])
 	handshake.mixHash(msg.Ephemeral[:])
 
-	// encrypt static key
 	ss, err := handshake.localEphemeral.sharedSecret(handshake.remoteStatic)
 	if err != nil {
 		return nil, err
 	}
-	var key [chacha20poly1305.KeySize]byte
-	KDF2(
-		&handshake.chainKey,
-		&key,
-		handshake.chainKey[:],
-		ss[:],
-	)
-	aead, _ := chacha20poly1305.New(key[:])
+	var kdfKey [wgcrypto.HashSize]byte
+	KDF2(&handshake.chainKey, &kdfKey, handshake.chainKey[:], ss[:])
+	aead, err := wgcrypto.NewAEADFromKDF(&kdfKey)
+	if err != nil {
+		return nil, err
+	}
 	aead.Seal(msg.Static[:0], ZeroNonce[:], device.staticIdentity.publicKey[:], handshake.hash[:])
 	handshake.mixHash(msg.Static[:])
 
-	// encrypt timestamp
 	if isZero(handshake.precomputedStaticStatic[:]) {
 		return nil, errInvalidPublicKey
 	}
-	KDF2(
-		&handshake.chainKey,
-		&key,
-		handshake.chainKey[:],
-		handshake.precomputedStaticStatic[:],
-	)
+	KDF2(&handshake.chainKey, &kdfKey, handshake.chainKey[:], handshake.precomputedStaticStatic[:])
 	timestamp := tai64n.Now()
-	aead, _ = chacha20poly1305.New(key[:])
+	aead, err = wgcrypto.NewAEADFromKDF(&kdfKey)
+	if err != nil {
+		return nil, err
+	}
 	aead.Seal(msg.Timestamp[:0], ZeroNonce[:], timestamp[:], handshake.hash[:])
 
-	// assign index
 	device.indexTable.Delete(handshake.localIndex)
 	msg.Sender, err = device.indexTable.NewIndexForHandshake(peer, handshake)
 	if err != nil {
@@ -339,8 +321,8 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 
 func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	var (
-		hash     [blake2s.Size]byte
-		chainKey [blake2s.Size]byte
+		hash     [wgcrypto.HashSize]byte
+		chainKey [wgcrypto.HashSize]byte
 	)
 
 	if msg.Type != MessageInitiationType {
@@ -354,22 +336,22 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	mixHash(&hash, &hash, msg.Ephemeral[:])
 	mixKey(&chainKey, &InitialChainKey, msg.Ephemeral[:])
 
-	// decrypt static key
 	var peerPK NoisePublicKey
-	var key [chacha20poly1305.KeySize]byte
+	var kdfKey [wgcrypto.HashSize]byte
 	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
 	if err != nil {
 		return nil
 	}
-	KDF2(&chainKey, &key, chainKey[:], ss[:])
-	aead, _ := chacha20poly1305.New(key[:])
+	KDF2(&chainKey, &kdfKey, chainKey[:], ss[:])
+	aead, err := wgcrypto.NewAEADFromKDF(&kdfKey)
+	if err != nil {
+		return nil
+	}
 	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
 	if err != nil {
 		return nil
 	}
 	mixHash(&hash, &hash, msg.Static[:])
-
-	// lookup peer
 
 	peer := device.LookupPeer(peerPK)
 	if peer == nil || !peer.isRunning.Load() {
@@ -377,8 +359,6 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	}
 
 	handshake := &peer.handshake
-
-	// verify identity
 
 	var timestamp tai64n.Timestamp
 
@@ -388,21 +368,18 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 		handshake.mutex.RUnlock()
 		return nil
 	}
-	KDF2(
-		&chainKey,
-		&key,
-		chainKey[:],
-		handshake.precomputedStaticStatic[:],
-	)
-	aead, _ = chacha20poly1305.New(key[:])
+	KDF2(&chainKey, &kdfKey, chainKey[:], handshake.precomputedStaticStatic[:])
+	aead, err = wgcrypto.NewAEADFromKDF(&kdfKey)
+	if err != nil {
+		handshake.mutex.RUnlock()
+		return nil
+	}
 	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
 	if err != nil {
 		handshake.mutex.RUnlock()
 		return nil
 	}
 	mixHash(&hash, &hash, msg.Timestamp[:])
-
-	// protect against replay & flood
 
 	replay := !timestamp.After(handshake.lastTimestamp)
 	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
@@ -415,8 +392,6 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake flood", peer)
 		return nil
 	}
-
-	// update handshake state
 
 	handshake.mutex.Lock()
 
@@ -450,8 +425,6 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 		return nil, errors.New("handshake initiation must be consumed first")
 	}
 
-	// assign index
-
 	var err error
 	device.indexTable.Delete(handshake.localIndex)
 	handshake.localIndex, err = device.indexTable.NewIndexForHandshake(peer, handshake)
@@ -464,13 +437,14 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	msg.Sender = handshake.localIndex
 	msg.Receiver = handshake.remoteIndex
 
-	// create ephemeral key
-
 	handshake.localEphemeral, err = newPrivateKey()
 	if err != nil {
 		return nil, err
 	}
-	msg.Ephemeral = handshake.localEphemeral.publicKey()
+	msg.Ephemeral, err = handshake.localEphemeral.publicKey()
+	if err != nil {
+		return nil, err
+	}
 	handshake.mixHash(msg.Ephemeral[:])
 	handshake.mixKey(msg.Ephemeral[:])
 
@@ -485,22 +459,17 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	}
 	handshake.mixKey(ss[:])
 
-	// add preshared key
+	var tau [wgcrypto.HashSize]byte
+	var kdfKey [wgcrypto.HashSize]byte
 
-	var tau [blake2s.Size]byte
-	var key [chacha20poly1305.KeySize]byte
-
-	KDF3(
-		&handshake.chainKey,
-		&tau,
-		&key,
-		handshake.chainKey[:],
-		handshake.presharedKey[:],
-	)
+	KDF3(&handshake.chainKey, &tau, &kdfKey, handshake.chainKey[:], handshake.presharedKey[:])
 
 	handshake.mixHash(tau[:])
 
-	aead, _ := chacha20poly1305.New(key[:])
+	aead, err := wgcrypto.NewAEADFromKDF(&kdfKey)
+	if err != nil {
+		return nil, err
+	}
 	aead.Seal(msg.Empty[:0], ZeroNonce[:], nil, handshake.hash[:])
 	handshake.mixHash(msg.Empty[:])
 
@@ -514,8 +483,6 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		return nil
 	}
 
-	// lookup handshake by receiver
-
 	lookup := device.indexTable.Lookup(msg.Receiver)
 	handshake := lookup.handshake
 	if handshake == nil {
@@ -523,13 +490,11 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	}
 
 	var (
-		hash     [blake2s.Size]byte
-		chainKey [blake2s.Size]byte
+		hash     [wgcrypto.HashSize]byte
+		chainKey [wgcrypto.HashSize]byte
 	)
 
 	ok := func() bool {
-		// lock handshake state
-
 		handshake.mutex.RLock()
 		defer handshake.mutex.RUnlock()
 
@@ -537,12 +502,8 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 			return false
 		}
 
-		// lock private key for reading
-
 		device.staticIdentity.RLock()
 		defer device.staticIdentity.RUnlock()
-
-		// finish 3-way DH
 
 		mixHash(&hash, &handshake.hash, msg.Ephemeral[:])
 		mixKey(&chainKey, &handshake.chainKey, msg.Ephemeral[:])
@@ -561,22 +522,15 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		mixKey(&chainKey, &chainKey, ss[:])
 		setZero(ss[:])
 
-		// add preshared key (psk)
-
-		var tau [blake2s.Size]byte
-		var key [chacha20poly1305.KeySize]byte
-		KDF3(
-			&chainKey,
-			&tau,
-			&key,
-			chainKey[:],
-			handshake.presharedKey[:],
-		)
+		var tau [wgcrypto.HashSize]byte
+		var kdfKey [wgcrypto.HashSize]byte
+		KDF3(&chainKey, &tau, &kdfKey, chainKey[:], handshake.presharedKey[:])
 		mixHash(&hash, &hash, tau[:])
 
-		// authenticate transcript
-
-		aead, _ := chacha20poly1305.New(key[:])
+		aead, err := wgcrypto.NewAEADFromKDF(&kdfKey)
+		if err != nil {
+			return false
+		}
 		_, err = aead.Open(nil, ZeroNonce[:], msg.Empty[:], hash[:])
 		if err != nil {
 			return false
@@ -588,8 +542,6 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	if !ok {
 		return nil
 	}
-
-	// update handshake state
 
 	handshake.mutex.Lock()
 
@@ -606,56 +558,43 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	return lookup.peer
 }
 
-/* Derives a new keypair from the current handshake state
- *
- */
 func (peer *Peer) BeginSymmetricSession() error {
 	device := peer.device
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()
 
-	// derive keys
-
 	var isInitiator bool
-	var sendKey [chacha20poly1305.KeySize]byte
-	var recvKey [chacha20poly1305.KeySize]byte
+	var sendKDF, recvKDF [wgcrypto.HashSize]byte
 
 	if handshake.state == handshakeResponseConsumed {
-		KDF2(
-			&sendKey,
-			&recvKey,
-			handshake.chainKey[:],
-			nil,
-		)
+		KDF2(&sendKDF, &recvKDF, handshake.chainKey[:], nil)
 		isInitiator = true
 	} else if handshake.state == handshakeResponseCreated {
-		KDF2(
-			&recvKey,
-			&sendKey,
-			handshake.chainKey[:],
-			nil,
-		)
+		KDF2(&recvKDF, &sendKDF, handshake.chainKey[:], nil)
 		isInitiator = false
 	} else {
 		return fmt.Errorf("invalid state for keypair derivation: %v", handshake.state)
 	}
 
-	// zero handshake
-
 	setZero(handshake.chainKey[:])
-	setZero(handshake.hash[:]) // Doesn't necessarily need to be zeroed. Could be used for something interesting down the line.
+	setZero(handshake.hash[:])
 	setZero(handshake.localEphemeral[:])
 	peer.handshake.state = handshakeZeroed
 
-	// create AEAD instances
-
 	keypair := new(Keypair)
-	keypair.send, _ = chacha20poly1305.New(sendKey[:])
-	keypair.receive, _ = chacha20poly1305.New(recvKey[:])
+	var err error
+	keypair.send, err = wgcrypto.NewAEADFromKDF(&sendKDF)
+	if err != nil {
+		return err
+	}
+	keypair.receive, err = wgcrypto.NewAEADFromKDF(&recvKDF)
+	if err != nil {
+		return err
+	}
 
-	setZero(sendKey[:])
-	setZero(recvKey[:])
+	setZero(sendKDF[:])
+	setZero(recvKDF[:])
 
 	keypair.created = time.Now()
 	keypair.replayFilter.Reset()
@@ -663,12 +602,8 @@ func (peer *Peer) BeginSymmetricSession() error {
 	keypair.localIndex = peer.handshake.localIndex
 	keypair.remoteIndex = peer.handshake.remoteIndex
 
-	// remap index
-
 	device.indexTable.SwapIndexForKeypair(handshake.localIndex, keypair)
 	handshake.localIndex = 0
-
-	// rotate key pairs
 
 	keypairs := &peer.keypairs
 	keypairs.Lock()
