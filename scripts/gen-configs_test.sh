@@ -2,9 +2,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PATH="$ROOT:$PATH"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
+BIN="$TMPDIR/bin"
+mkdir -p "$BIN"
+GO_BIN="$(command -v go || true)"
+if [[ -z "$GO_BIN" ]]; then
+  for candidate in /home/ubuntu/.local/go/go/bin/go /usr/local/go/bin/go; do
+    [[ -x "$candidate" ]] && { GO_BIN="$candidate"; break; }
+  done
+fi
+[[ -n "$GO_BIN" ]] || { echo "go is required to build wg-gm" >&2; exit 1; }
+"$GO_BIN" build -o "$BIN/wg-gm" "$ROOT/cmd/wg-gm"
+PATH="$BIN:$PATH"
 
 OUT="$TMPDIR/out"
 
